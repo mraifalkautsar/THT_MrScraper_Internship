@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+catboost_info/
+outputs/smoke_*/
+docs/
+.agents/
+.codex/
