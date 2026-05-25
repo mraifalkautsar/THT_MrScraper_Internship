@@ -2,6 +2,86 @@
 
 This repository reconstructs missing marketplace prices during a simulated scraping outage. The pipeline uses historical product/shop/category behavior, a global CatBoost model, entity-level price priors, and optional anchor-based day calibration.
 
+## Repository Map
+
+```text
+README.md                                      Main submission guide, approach, commands, results
+requirements.txt                               Python dependencies
+ecommerce_price_prediction-train.csv           Historical training data
+ecommerce_price_prediction-test-3-days.csv     Provided 3-day test/outage sample
+src/                                           Reusable pipeline code
+  config.py                                    Central pipeline configuration
+  data.py                                      Data loading and submission checks
+  features.py                                  Feature engineering and leakage-safe history features
+  model.py                                     CatBoost training and prediction helpers
+  calibration.py                               Anchor calibration and second-stage residual logic
+  strategies.py                                Prediction strategy names and selection helpers
+  validation.py                                Outage-style validation loop
+  inference.py                                 Test prediction pipeline
+  tuning.py                                    Hyperparameter search utilities
+scripts/                                       CLI entrypoints
+  run_validation.py                            Reproduce outage-style validation outputs
+  predict_test.py                              Fill missing prices in the test file
+  tune_hyperparameters.py                      Optional tuning script
+notebook.ipynb                                 Report-style notebook using saved/runnable outputs
+eda.ipynb                                      EDA, coverage checks, and error diagnostics
+outputs/                                       Validation/prediction artifacts
+```
+
+## Quickstart
+
+Install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Run the main validation:
+
+```bash
+python scripts/run_validation.py \
+  --validation-days 3 \
+  --anchors-per-day 100 \
+  --test-like-only \
+  --output-dir outputs
+```
+
+Run the final test prediction on the provided test file:
+
+```bash
+python scripts/predict_test.py \
+  --prediction-variant anchor_gated_fallback_calibration \
+  --output-dir outputs
+```
+
+For a fast smoke check:
+
+```bash
+python scripts/run_validation.py \
+  --sample-rows 5000 \
+  --validation-days 1 \
+  --anchors-per-day 20 \
+  --iterations 20 \
+  --test-like-only \
+  --output-dir outputs/smoke_validation
+
+python scripts/predict_test.py \
+  --iterations 20 \
+  --prediction-variant anchor_gated_fallback_calibration \
+  --output-dir outputs/smoke_prediction
+```
+
+Expected prediction output:
+
+```text
+outputs/completed_test_predictions.csv
+```
+
+The prediction script verifies row count, fills all missing prices, clips/guards against
+negative prices, and preserves known anchor prices.
+
 ## Problem Setup
 
 The target column is `price`. Training data contains historical prices. The test file contains outage-day rows where most prices are missing, plus a small set of known anchor prices. The pipeline must fill only the missing prices while preserving known anchor prices.
@@ -19,7 +99,21 @@ The production-style pipeline is implemented in `src/` and can be run from `scri
 7. Use known same-day anchor prices to estimate calibration residuals.
 8. Fill missing prices and run output sanity checks.
 
-The notebook remains useful as an exploratory/report artifact, but the runnable pipeline is now script-based.
+The notebook remains useful as an exploratory/report artifact, but the runnable pipeline is script-based.
+
+## Final Strategy
+
+The default submission strategy is:
+
+```text
+anchor_gated_fallback_calibration
+```
+
+This strategy keeps recent entity prices unchanged when there is prior product/listing
+history, then uses anchors only to choose calibrated or uncalibrated fallback behavior for
+weaker-history rows. Validation showed that direct recent entity prices dominate for repeated
+products, while broad calibration can hurt rows that were already correct. The final strategy
+therefore uses anchors conservatively instead of applying a global correction to every row.
 
 ## Feature Groups
 
@@ -212,20 +306,18 @@ assignment setting because test products are expected to have prior training his
   - Basically like the previous hybrid strategy, but calibrated with day-level correction.
 
 - `anchor_gated_fallback_calibration`
-  - Current default final strategy.
+  - The current default final strategy.
   - Keeps recent entity prices unchanged.
   - For weak-history fallback rows, uses fallback-like anchors to choose whether calibrated or uncalibrated fallback predictions are more reliable on that outage day.
   - This is the most conservative anchor-use strategy: anchors influence fallback behavior without overriding strong entity priors.
 
-- `second_stage_residual`
-  - It learns a same-day residual correction from anchor residual
-  features. 
-  - Details are in the section below because this strategy is more complex than
-  the median-residual calibration variants.
-
 **Meta / Diagnostic Strategy**
 
 - `anchor_model_selection`: chooses the best candidate strategy per day based on anchor MAE. It can select either global or entity variants, so it is treated as a comparison/meta-strategy rather than a pure Approach 1 or Approach 2 model.
+- `second_stage_residual`
+  - Learns a same-day residual correction from anchor residual features.
+  - Details are in the section below because this strategy is more complex than
+  the median-residual calibration variants.
 - Selective calibration can be enabled with `--selective-calibration` to skip calibration when anchor evidence is weak or noisy.
 
 The main strategy is now gated fallback calibration, because validation and anchor EDA show
@@ -293,35 +385,41 @@ Safeguards:
 
 ## Run Validation
 
-Install dependencies first:
-
-```bash
-pip install -r requirements.txt
-```
-
 Run the full validation:
 
 ```bash
-python scripts/run_validation.py
+python scripts/run_validation.py \
+  --validation-days 3 \
+  --anchors-per-day 100 \
+  --test-like-only \
+  --output-dir outputs
 ```
 
 Run validation with safer calibration controls:
 
 ```bash
 python scripts/run_validation.py \
+  --validation-days 3 \
+  --anchors-per-day 100 \
+  --test-like-only \
   --calibration-delta-cap 0.05 \
   --selective-calibration \
   --calibration-min-anchors 50 \
   --calibration-max-residual-iqr 0.10 \
-  --calibration-min-abs-global-delta 0.01
+  --calibration-min-abs-global-delta 0.01 \
+  --output-dir outputs/validation_selective
 ```
 
 Run validation while changing the learned second-stage residual settings:
 
 ```bash
 python scripts/run_validation.py \
+  --validation-days 3 \
+  --anchors-per-day 100 \
+  --test-like-only \
   --second-stage-alpha 10 \
-  --second-stage-min-anchors 10
+  --second-stage-min-anchors 10 \
+  --output-dir outputs/validation_second_stage
 ```
 
 Run assignment-aligned validation that keeps only rows with prior `modelId` or `itemId` history before the validation day:
@@ -337,7 +435,13 @@ python scripts/run_validation.py \
 For a quick smoke test:
 
 ```bash
-python scripts/run_validation.py --sample-rows 5000 --validation-days 1 --anchors-per-day 20 --iterations 20
+python scripts/run_validation.py \
+  --sample-rows 5000 \
+  --validation-days 1 \
+  --anchors-per-day 20 \
+  --iterations 20 \
+  --test-like-only \
+  --output-dir outputs/smoke_validation
 ```
 
 Validation simulates the production outage with a chronological split:
@@ -364,7 +468,7 @@ hidden test rows.
 The `--test-like-only` option keeps only validation rows with prior `modelId` or `itemId`
 history before the validation day. This better matches the assignment statement that the
 remaining test products have appeared in training before, and should be used for the main
-interview-facing validation check.
+assignment-aligned validation check.
 
 Outputs:
 
@@ -380,6 +484,27 @@ artifact for understanding whether errors come from sparse history, expensive pr
 specific calibration decision. `validation_predictions.csv` contains row-level validation
 predictions and errors by strategy, which is used by the EDA notebook to inspect worst
 misses and compare which strategy wins on each hidden row.
+
+## Inspect EDA And Results
+
+Use these files for review:
+
+- `notebook.ipynb`: report-style walkthrough of validation results, strategy comparison,
+  and final prediction workflow.
+- `eda.ipynb`: data coverage checks, train/test frequency analysis, anchor diagnostics,
+  strategy error diagnostics, and failure-mode mitigation EDA.
+- `outputs/validation_summary.csv`: headline strategy metrics.
+- `outputs/validation_results.csv`: per-date metrics by strategy.
+- `outputs/validation_segments.csv`: metrics by date, price bucket, history-count bucket,
+  and calibration status.
+- `outputs/validation_predictions.csv`: row-level predictions/errors used to understand
+  where each strategy fails.
+- `outputs/completed_test_predictions.csv`: completed test file after running prediction.
+
+The EDA notebook includes the check requested by the PDF statement that hidden test products
+have appeared in training before. At item/listing level the provided test products are covered
+by training history; a small number of exact `modelId` variants can be sparse, which is why the
+pipeline keeps both `modelId` and `itemId` fallback logic.
 
 ## Tune Hyperparameters
 
@@ -439,7 +564,9 @@ This makes `entity_smoothing` and `calibration_smoothing` validation-tuned inste
 Run:
 
 ```bash
-python scripts/predict_test.py
+python scripts/predict_test.py \
+  --prediction-variant anchor_gated_fallback_calibration \
+  --output-dir outputs
 ```
 
 Choose a final prediction variant:
@@ -458,7 +585,10 @@ python scripts/predict_test.py --prediction-variant second_stage_residual
 For a faster smoke run:
 
 ```bash
-python scripts/predict_test.py --iterations 20 --prediction-variant anchor_gated_fallback_calibration
+python scripts/predict_test.py \
+  --iterations 20 \
+  --prediction-variant anchor_gated_fallback_calibration \
+  --output-dir outputs/smoke_prediction
 ```
 
 Output:
@@ -484,10 +614,11 @@ Average hidden-row metrics:
 anchor_gated_fallback_calibration: MAE 38,129  | RMSE 0.96M  | MAPE 0.142%
 last_price_baseline:               MAE 38,129  | RMSE 0.96M  | MAPE 0.142%
 hybrid_last_price_uncalibrated..:  MAE 38,129  | RMSE 0.96M  | MAPE 0.142%
-entity_blend_calibrated:           MAE 332,932 | RMSE 3.45M  | MAPE 0.559%
-entity_blend_no_calibration:       MAE 336,883 | RMSE 3.52M  | MAPE 0.580%
-global_calibrated:                 MAE 1.00M   | RMSE 10.77M | MAPE 1.648%
-global_no_calibration:             MAE 1.01M   | RMSE 10.95M | MAPE 1.707%
+entity_blend_no_calibration:       MAE 349,680 | RMSE 3.88M  | MAPE 0.462%
+entity_blend_calibrated:           MAE 369,683 | RMSE 3.76M  | MAPE 0.463%
+second_stage_residual:             MAE 468,973 | RMSE 4.12M  | MAPE 0.559%
+global_no_calibration:             MAE 948,706 | RMSE 9.77M  | MAPE 1.207%
+global_calibrated:                 MAE 968,182 | RMSE 9.57M  | MAPE 1.200%
 ```
 
 MAPE is reported as a percentage in the code. For example, `0.142` means `0.142%`
@@ -544,15 +675,44 @@ CSV files using the fixed `random_seed` in `PipelineConfig`, then writes
 `outputs/completed_test_predictions.csv`. This keeps the repository lightweight while still
 satisfying reproducibility through code and pinned dependencies.
 
-## Criticism And Next Improvements
+## Solution Coverage
 
-The pipeline structure is defensible for this task, but there are clear improvements:
+This submission covers the requested modelling and analysis dimensions:
 
-- Tune `entity_smoothing` and `calibration_smoothing` with rolling time validation.
-- Add more robust fallback behavior for true cold-start variants that have no prior `modelId`
-  history but do have `itemId` history.
-- Evaluate and report by shop/category in addition to the existing date, price-bucket, and
-  history-count segments.
-- Promote or remove the learned second-stage residual model after more rolling validation.
-- Compare CatBoost with LightGBM or XGBoost.
-- Save model artifacts if repeated inference is required.
+- **Prediction accuracy**: `outputs/validation_summary.csv` reports MAE, RMSE, and MAPE
+  for global, entity-aware, calibrated, anchor-selected, and second-stage residual strategies.
+- **Anchor set utilization**: the pipeline evaluates global day calibration, segment
+  calibration, anchor-gated fallback selection, anchor model selection, and learned
+  second-stage residual correction.
+- **Feature engineering**: `src/features.py` builds temporal, discount, stock, engagement,
+  historical aggregate, recent-price, fallback entity, and time-aware metadata-imputation
+  features.
+- **Global vs. entity-aware modelling**: the global CatBoost model provides the marketplace
+  baseline, while the entity-aware family uses `modelId`/`itemId`/`shopId` history and
+  anchor-aware fallback logic.
+- **Analysis and insights**: `eda.ipynb` includes train/test coverage, product frequency,
+  anchor diagnostics, strategy error diagnostics, and failure-mode mitigation analysis.
+- **Reproducibility**: the pipeline is script-based, deterministic through
+  `PipelineConfig.random_seed`, organized under `src/`, and runnable with the CLI commands
+  in this README.
+
+## Key Findings
+
+- The task behaves more like outage reconstruction than generic price regression. Historical
+  product prices provide the base estimate, while anchors provide same-day calibration signal.
+- Entity-aware strategies substantially outperform the global marketplace model because the
+  provided test products have prior history and prices are sticky across adjacent scrape days.
+- The best validation strategies collapse to recent entity price for most rows. This explains
+  why `last_price_baseline`, the hybrid strategies, and the final anchor-gated strategy are
+  tied in the current validation summary.
+- Broad anchor calibration can help weaker global/model variants, but it can also move
+  already-correct recent entity prices away from the truth.
+- The final strategy therefore uses anchors conservatively: keep strong recent entity prices
+  unchanged and use anchors mainly for fallback behavior.
+- MAPE is reported as a percentage. A value like `0.142` means `0.142%`, not `14.2%`.
+- The remaining error is concentrated in a small number of tail rows, especially true price
+  jumps, stale item-level histories, and variant-level mismatches where exact `modelId`
+  evidence is weak.
+- `second_stage_residual` is included as a diagnostic strategy. It learns same-day residual
+  corrections from anchors with a regularized Ridge model, but it is not the default because
+  current validation still favors recent entity history.
