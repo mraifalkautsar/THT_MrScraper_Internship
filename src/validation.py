@@ -8,19 +8,28 @@ from .calibration import (
 )
 from .config import PipelineConfig
 from .data import basic_preprocess
-from .features import build_features, get_cat_feature_indices, get_feature_columns
+from .features import (
+    HIDDEN_UNAVAILABLE_RAW_COLS,
+    build_features,
+    get_cat_feature_indices,
+    get_feature_columns,
+)
 from .model import add_model_predictions, train_global_model
 from .strategies import (
+    ANCHOR_GATED_FALLBACK_CALIBRATION,
     ENTITY_BLEND_CALIBRATED,
     ENTITY_BLEND_NO_CALIBRATION,
     GLOBAL_CALIBRATED,
     GLOBAL_NO_CALIBRATION,
     HYBRID_LAST_PRICE_CALIBRATED_FALLBACK,
-    HYBRID_LAST_PRICE_ENTITY,
+    HYBRID_LAST_PRICE_UNCALIBRATED_FALLBACK,
     LAST_PRICE_BASELINE,
     SECOND_STAGE_RESIDUAL,
+    choose_fallback_variant_by_anchor_mae,
     choose_variant_by_anchor_mae,
+    has_recent_entity_history,
     hybrid_last_price_then_log_prediction,
+    log_predictions_to_price,
 )
 
 
@@ -70,6 +79,24 @@ def make_prediction_frame(
         },
         index=rows.index,
     )
+    id_cols = [
+        "shopId",
+        "itemId",
+        "modelId",
+        "cat_id",
+        "brand",
+        "model_pred_log",
+        "blended_pred_log",
+        "fallback_entity_price_log",
+        "entity_weight",
+        "modelId_recent_prior_count",
+        "itemId_recent_prior_count",
+        "modelId_hours_since_last_seen",
+        "itemId_hours_since_last_seen",
+    ]
+    for col in id_cols:
+        if col in rows.columns:
+            frame[col] = rows[col].values
     frame["abs_error"] = (frame["y_true"] - frame["y_pred"]).abs()
     frame["pct_error"] = np.where(
         frame["y_true"] != 0, frame["abs_error"] / frame["y_true"] * 100, np.nan
@@ -80,18 +107,32 @@ def make_prediction_frame(
             "calibration_applied",
             "calibration_skip_reason",
             "calibration_delta_log",
+            "second_stage_applied",
+            "second_stage_skip_reason",
+            "second_stage_delta_log",
             "anchor_count",
             "anchor_residual_iqr",
             "anchor_global_delta",
         ]
         available_meta_cols = [col for col in meta_cols if col in calibration_meta.columns]
         frame = frame.join(calibration_meta[available_meta_cols], how="left")
-    else:
+    if "calibration_applied" not in frame.columns:
         frame["calibration_applied"] = False
+    if "calibration_skip_reason" not in frame.columns:
         frame["calibration_skip_reason"] = "not_calibrated"
+    if "calibration_delta_log" not in frame.columns:
         frame["calibration_delta_log"] = 0.0
+    if "second_stage_applied" not in frame.columns:
+        frame["second_stage_applied"] = False
+    if "second_stage_skip_reason" not in frame.columns:
+        frame["second_stage_skip_reason"] = "not_second_stage"
+    if "second_stage_delta_log" not in frame.columns:
+        frame["second_stage_delta_log"] = 0.0
+    if "anchor_count" not in frame.columns:
         frame["anchor_count"] = np.nan
+    if "anchor_residual_iqr" not in frame.columns:
         frame["anchor_residual_iqr"] = np.nan
+    if "anchor_global_delta" not in frame.columns:
         frame["anchor_global_delta"] = np.nan
 
     return frame.reset_index(drop=True)
@@ -119,9 +160,18 @@ def add_validation_segments(prediction_rows: pd.DataFrame) -> pd.DataFrame:
         labels=["0", "1-5", "6-20", "21-100", "100+"],
     ).astype(str)
     df["calibration_status"] = np.where(
-        df["calibration_applied"].fillna(False),
-        "applied",
-        df["calibration_skip_reason"].fillna("not_calibrated"),
+        df["second_stage_applied"].fillna(False),
+        "second_stage_applied",
+        np.where(
+            df["calibration_applied"].fillna(False),
+            "applied",
+            df["calibration_skip_reason"].fillna("not_calibrated"),
+        ),
+    )
+    df["calibration_status"] = np.where(
+        df["variant"].eq(SECOND_STAGE_RESIDUAL) & ~df["second_stage_applied"].fillna(False),
+        df["second_stage_skip_reason"].fillna("second_stage_not_applied"),
+        df["calibration_status"],
     )
     return df
 
@@ -168,9 +218,98 @@ def build_segment_summary(prediction_rows: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def filter_to_test_like_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep validation rows that have prior product evidence before the outage day."""
+    has_model_history = (
+        df["modelId_recent_prior_count"].fillna(0) > 0
+        if "modelId_recent_prior_count" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    has_item_history = (
+        df["itemId_recent_prior_count"].fillna(0) > 0
+        if "itemId_recent_prior_count" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    return df[has_model_history | has_item_history].copy()
+
+def append_prediction_eval(
+    eval_rows: list[dict[str, float | int | str]],
+    prediction_rows: list[pd.DataFrame],
+    hidden: pd.DataFrame,
+    y_pred: pd.Series,
+    variant: str,
+    date: str,
+    config: PipelineConfig,
+    calibration_meta: pd.DataFrame | None = None,
+) -> None:
+    eval_rows.append(
+        evaluate_predictions(hidden[config.target], y_pred, f"{date} {variant}")
+    )
+    prediction_rows.append(
+        make_prediction_frame(
+            hidden,
+            y_pred,
+            variant,
+            date,
+            config.target,
+            calibration_meta=calibration_meta,
+        )
+    )
+
+def calibrated_candidate_logs(
+    day_df: pd.DataFrame, config: PipelineConfig
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.Series]]:
+    cal_global = calibrate_day_from_anchor_residuals(
+        day_df.assign(blended_pred_log=day_df["model_pred_log"]),
+        config,
+        pred_log_col="blended_pred_log",
+    )
+    cal_blend = calibrate_day_from_anchor_residuals(
+        day_df, config, pred_log_col="blended_pred_log"
+    )
+    candidates = {
+        LAST_PRICE_BASELINE: day_df["fallback_entity_price_log"],
+        HYBRID_LAST_PRICE_UNCALIBRATED_FALLBACK: hybrid_last_price_then_log_prediction(
+            day_df, "blended_pred_log"
+        ),
+        HYBRID_LAST_PRICE_CALIBRATED_FALLBACK: hybrid_last_price_then_log_prediction(
+            cal_blend, "calibrated_pred_log"
+        ),
+        GLOBAL_NO_CALIBRATION: day_df["model_pred_log"],
+        ENTITY_BLEND_NO_CALIBRATION: day_df["blended_pred_log"],
+        GLOBAL_CALIBRATED: cal_global["calibrated_pred_log"],
+        ENTITY_BLEND_CALIBRATED: cal_blend["calibrated_pred_log"],
+    }
+    return cal_global, cal_blend, candidates
+
+def add_validation_anchor_split(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    df = df.copy()
+    if "_validation_row_id" not in df.columns:
+        df["_validation_row_id"] = np.arange(len(df))
+    df["_validation_is_anchor"] = False
+    for _, day_df in df.groupby("date"):
+        anchor_idx = day_df.sample(
+            n=min(config.anchors_per_day, len(day_df)),
+            random_state=config.random_seed,
+        ).index
+        df.loc[anchor_idx, "_validation_is_anchor"] = True
+    return df
+
+def mask_hidden_validation_columns(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    """Mask held-out validation fields that are unavailable on real hidden test rows."""
+    df = df.copy()
+    hidden_mask = ~df["_validation_is_anchor"]
+    cols_to_mask = [
+        col
+        for col in HIDDEN_UNAVAILABLE_RAW_COLS
+        if col in df.columns and col != config.target
+    ]
+    df.loc[hidden_mask, cols_to_mask] = np.nan
+    return df
+
 def run_outage_validation(
     train_df: pd.DataFrame, config: PipelineConfig
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = basic_preprocess(train_df, config)
     unique_dates = sorted(df["date"].unique())
     val_dates = unique_dates[-config.validation_days :]
@@ -178,6 +317,17 @@ def run_outage_validation(
 
     history_df = df[df["date"].isin(train_dates)].copy()
     val_raw = df[df["date"].isin(val_dates)].copy()
+    val_raw["_validation_row_id"] = np.arange(len(val_raw))
+    if config.validation_test_like_only:
+        prelim_val_feat = build_features(history_df, val_raw, config)
+        test_like_row_ids = filter_to_test_like_rows(prelim_val_feat)[
+            "_validation_row_id"
+        ]
+        val_raw = val_raw[val_raw["_validation_row_id"].isin(test_like_row_ids)].copy()
+
+    val_raw = add_validation_anchor_split(val_raw, config)
+    if config.validation_mask_hidden_like_test:
+        val_raw = mask_hidden_validation_columns(val_raw, config)
 
     train_feat = build_features(history_df, history_df, config)
     val_feat = build_features(history_df, val_raw, config)
@@ -190,186 +340,107 @@ def run_outage_validation(
     prediction_rows = []
     for date, day_df in val_feat.groupby("date"):
         day_df = day_df.copy()
-        anchor_idx = day_df.sample(
-            n=min(config.anchors_per_day, len(day_df)),
-            random_state=config.random_seed,
-        ).index
+        anchor_idx = day_df[day_df["_validation_is_anchor"]].index
         hidden_idx = day_df.index.difference(anchor_idx)
         hidden = day_df.loc[hidden_idx].copy()
 
-        model_pred = np.expm1(hidden["model_pred_log"]).clip(lower=0)
-        blend_pred = np.expm1(hidden["blended_pred_log"]).clip(lower=0)
-        last_price_baseline_pred = np.expm1(hidden["fallback_entity_price_log"]).clip(lower=0)
-        hybrid_log = hybrid_last_price_then_log_prediction(hidden, "blended_pred_log")
-        hybrid_pred = np.expm1(hybrid_log).clip(lower=0)
-        eval_rows.append(
-            evaluate_predictions(
-                hidden[config.target], last_price_baseline_pred, f"{date} {LAST_PRICE_BASELINE}"
-            )
-        )
-        prediction_rows.append(
-            make_prediction_frame(
-                hidden,
-                last_price_baseline_pred,
-                LAST_PRICE_BASELINE,
-                date,
-                config.target,
-            )
-        )
-        eval_rows.append(
-            evaluate_predictions(
-                hidden[config.target], hybrid_pred, f"{date} {HYBRID_LAST_PRICE_ENTITY}"
-            )
-        )
-        prediction_rows.append(
-            make_prediction_frame(
-                hidden,
-                hybrid_pred,
-                HYBRID_LAST_PRICE_ENTITY,
-                date,
-                config.target,
-            )
-        )
-        eval_rows.append(
-            evaluate_predictions(hidden[config.target], model_pred, f"{date} {GLOBAL_NO_CALIBRATION}")
-        )
-        prediction_rows.append(
-            make_prediction_frame(
-                hidden, model_pred, GLOBAL_NO_CALIBRATION, date, config.target
-            )
-        )
-        eval_rows.append(
-            evaluate_predictions(
-                hidden[config.target], blend_pred, f"{date} {ENTITY_BLEND_NO_CALIBRATION}"
-            )
-        )
-        prediction_rows.append(
-            make_prediction_frame(
-                hidden, blend_pred, ENTITY_BLEND_NO_CALIBRATION, date, config.target
-            )
-        )
-
         day_for_cal = day_df.copy()
         day_for_cal.loc[hidden_idx, config.target] = np.nan
+        cal_global, cal_blend, candidate_logs = calibrated_candidate_logs(
+            day_for_cal, config
+        )
 
-        cal_global = calibrate_day_from_anchor_residuals(
-            day_for_cal.assign(blended_pred_log=day_for_cal["model_pred_log"]),
-            config,
-            pred_log_col="blended_pred_log",
-        )
-        cal_global_pred = np.expm1(cal_global.loc[hidden_idx, "calibrated_pred_log"]).clip(lower=0)
-        eval_rows.append(
-            evaluate_predictions(hidden[config.target], cal_global_pred, f"{date} {GLOBAL_CALIBRATED}")
-        )
-        prediction_rows.append(
-            make_prediction_frame(
+        calibration_meta_by_variant = {
+            GLOBAL_CALIBRATED: cal_global.loc[hidden_idx],
+            ENTITY_BLEND_CALIBRATED: cal_blend.loc[hidden_idx],
+            HYBRID_LAST_PRICE_CALIBRATED_FALLBACK: cal_blend.loc[hidden_idx],
+        }
+        for variant in [
+            LAST_PRICE_BASELINE,
+            HYBRID_LAST_PRICE_UNCALIBRATED_FALLBACK,
+            GLOBAL_NO_CALIBRATION,
+            ENTITY_BLEND_NO_CALIBRATION,
+            GLOBAL_CALIBRATED,
+            ENTITY_BLEND_CALIBRATED,
+            HYBRID_LAST_PRICE_CALIBRATED_FALLBACK,
+        ]:
+            append_prediction_eval(
+                eval_rows,
+                prediction_rows,
                 hidden,
-                cal_global_pred,
-                GLOBAL_CALIBRATED,
+                log_predictions_to_price(candidate_logs[variant].loc[hidden_idx]),
+                variant,
                 date,
-                config.target,
-                calibration_meta=cal_global.loc[hidden_idx],
+                config,
+                calibration_meta=calibration_meta_by_variant.get(variant),
             )
+
+        fallback_candidates = {
+            name: candidate_logs[name]
+            for name in [
+                ENTITY_BLEND_NO_CALIBRATION,
+                ENTITY_BLEND_CALIBRATED,
+                GLOBAL_NO_CALIBRATION,
+                GLOBAL_CALIBRATED,
+            ]
+        }
+        recent_mask = has_recent_entity_history(day_df)
+        selected_fallback_variant = choose_fallback_variant_by_anchor_mae(
+            day_for_cal,
+            config.target,
+            fallback_candidates,
+            fallback_anchor_mask=~recent_mask,
+        )
+        gated_log = day_df["fallback_entity_price_log"].where(
+            recent_mask,
+            fallback_candidates[selected_fallback_variant].loc[day_df.index],
+        )
+        gated_pred = log_predictions_to_price(gated_log.loc[hidden_idx])
+        gated_meta = cal_blend.loc[hidden_idx].copy()
+        gated_meta["calibration_applied"] = (
+            selected_fallback_variant in {ENTITY_BLEND_CALIBRATED, GLOBAL_CALIBRATED}
+        )
+        gated_meta["calibration_skip_reason"] = selected_fallback_variant
+        append_prediction_eval(
+            eval_rows,
+            prediction_rows,
+            hidden,
+            gated_pred,
+            f"{ANCHOR_GATED_FALLBACK_CALIBRATION}_{selected_fallback_variant}",
+            date,
+            config,
+            calibration_meta=gated_meta,
         )
 
-        cal_blend = calibrate_day_from_anchor_residuals(
+        selected_variant = choose_variant_by_anchor_mae(
+            day_for_cal, config.target, candidate_logs
+        )
+        append_prediction_eval(
+            eval_rows,
+            prediction_rows,
+            hidden,
+            log_predictions_to_price(candidate_logs[selected_variant].loc[hidden_idx]),
+            f"anchor_model_selected_{selected_variant}",
+            date,
+            config,
+        )
+
+        second_stage = second_stage_residual_calibrate_day(
             day_for_cal, config, pred_log_col="blended_pred_log"
         )
-        cal_blend_pred = np.expm1(cal_blend.loc[hidden_idx, "calibrated_pred_log"]).clip(lower=0)
-        eval_rows.append(
-            evaluate_predictions(
-                hidden[config.target], cal_blend_pred, f"{date} {ENTITY_BLEND_CALIBRATED}"
-            )
-        )
-        prediction_rows.append(
-            make_prediction_frame(
-                hidden,
-                cal_blend_pred,
-                ENTITY_BLEND_CALIBRATED,
-                date,
-                config.target,
-                calibration_meta=cal_blend.loc[hidden_idx],
-            )
-        )
-        hybrid_calibrated_log = hybrid_last_price_then_log_prediction(
-            cal_blend.loc[hidden_idx], "calibrated_pred_log"
-        )
-        hybrid_calibrated_pred = np.expm1(hybrid_calibrated_log).clip(lower=0)
-        eval_rows.append(
-            evaluate_predictions(
-                hidden[config.target],
-                hybrid_calibrated_pred,
-                f"{date} {HYBRID_LAST_PRICE_CALIBRATED_FALLBACK}",
-            )
-        )
-        prediction_rows.append(
-            make_prediction_frame(
-                hidden,
-                hybrid_calibrated_pred,
-                HYBRID_LAST_PRICE_CALIBRATED_FALLBACK,
-                date,
-                config.target,
-                calibration_meta=cal_blend.loc[hidden_idx],
-            )
-        )
-
-        candidate_log_predictions = {
-            LAST_PRICE_BASELINE: day_df["fallback_entity_price_log"],
-            HYBRID_LAST_PRICE_ENTITY: hybrid_last_price_then_log_prediction(
-                day_df, "blended_pred_log"
-            ),
-            HYBRID_LAST_PRICE_CALIBRATED_FALLBACK: hybrid_last_price_then_log_prediction(
-                cal_blend, "calibrated_pred_log"
-            ),
-            GLOBAL_NO_CALIBRATION: day_df["model_pred_log"],
-            ENTITY_BLEND_NO_CALIBRATION: day_df["blended_pred_log"],
-            GLOBAL_CALIBRATED: cal_global["calibrated_pred_log"],
-            ENTITY_BLEND_CALIBRATED: cal_blend["calibrated_pred_log"],
-        }
-        selected_variant = choose_variant_by_anchor_mae(
-            day_for_cal, config.target, candidate_log_predictions
-        )
-        selected_pred = np.expm1(
-            candidate_log_predictions[selected_variant].loc[hidden_idx]
+        second_stage_pred = np.expm1(
+            second_stage.loc[hidden_idx, "second_stage_pred_log"]
         ).clip(lower=0)
-        eval_rows.append(
-            evaluate_predictions(
-                hidden[config.target],
-                selected_pred,
-                f"{date} anchor_model_selected_{selected_variant}",
-            )
+        append_prediction_eval(
+            eval_rows,
+            prediction_rows,
+            hidden,
+            second_stage_pred,
+            SECOND_STAGE_RESIDUAL,
+            date,
+            config,
+            calibration_meta=second_stage.loc[hidden_idx],
         )
-        prediction_rows.append(
-            make_prediction_frame(
-                hidden,
-                selected_pred,
-                f"anchor_model_selected_{selected_variant}",
-                date,
-                config.target,
-            )
-        )
-
-        if config.include_experimental_variants:
-            second_stage = second_stage_residual_calibrate_day(
-                day_for_cal, config, pred_log_col="blended_pred_log"
-            )
-            second_stage_pred = np.expm1(
-                second_stage.loc[hidden_idx, "second_stage_pred_log"]
-            ).clip(lower=0)
-            eval_rows.append(
-                evaluate_predictions(
-                    hidden[config.target], second_stage_pred, f"{date} {SECOND_STAGE_RESIDUAL}"
-                )
-            )
-            prediction_rows.append(
-                make_prediction_frame(
-                    hidden,
-                    second_stage_pred,
-                    SECOND_STAGE_RESIDUAL,
-                    date,
-                    config.target,
-                )
-            )
 
     results = pd.DataFrame(eval_rows)
     summary = (
@@ -384,4 +455,4 @@ def run_outage_validation(
     )
     prediction_frame = pd.concat(prediction_rows, ignore_index=True)
     segment_summary = build_segment_summary(prediction_frame)
-    return results, summary, segment_summary
+    return results, summary, segment_summary, prediction_frame

@@ -1,0 +1,19 @@
+segment,key,test_rows_checked,rows_seen_in_train,rows_unseen_in_train,row_seen_pct,test_unique_keys,unique_seen_in_train,unique_unseen_in_train,unique_seen_pct
+all_test_rows,shopId,25900,25900,0,100.0,150,150,0,100.0
+all_test_rows,itemId,25900,25900,0,100.0,953,953,0,100.0
+all_test_rows,modelId,25900,25898,2,99.99227799227799,3871,3869,2,99.9483337638853
+all_test_rows,shopId + itemId,25900,25900,0,100.0,953,953,0,100.0
+all_test_rows,itemId + modelId,25900,25898,2,99.99227799227799,3871,3869,2,99.9483337638853
+all_test_rows,shopId + itemId + modelId,25900,25898,2,99.99227799227799,3871,3869,2,99.9483337638853
+hidden_missing_price_rows,shopId,25600,25600,0,100.0,150,150,0,100.0
+hidden_missing_price_rows,itemId,25600,25600,0,100.0,953,953,0,100.0
+hidden_missing_price_rows,modelId,25600,25598,2,99.9921875,3854,3852,2,99.94810586403736
+hidden_missing_price_rows,shopId + itemId,25600,25600,0,100.0,953,953,0,100.0
+hidden_missing_price_rows,itemId + modelId,25600,25598,2,99.9921875,3854,3852,2,99.94810586403736
+hidden_missing_price_rows,shopId + itemId + modelId,25600,25598,2,99.9921875,3854,3852,2,99.94810586403736
+known_anchor_rows,shopId,300,300,0,100.0,67,67,0,100.0
+known_anchor_rows,itemId,300,300,0,100.0,183,183,0,100.0
+known_anchor_rows,modelId,300,300,0,100.0,278,278,0,100.0
+known_anchor_rows,shopId + itemId,300,300,0,100.0,183,183,0,100.0
+known_anchor_rows,itemId + modelId,300,300,0,100.0,278,278,0,100.0
+known_anchor_rows,shopId + itemId + modelId,300,300,0,100.0,278,278,0,100.0

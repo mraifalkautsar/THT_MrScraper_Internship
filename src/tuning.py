@@ -89,7 +89,7 @@ def tune_pipeline(
             calibration_delta_cap=calibration_delta_cap,
         )
 
-        results, summary, _ = run_outage_validation(train_df, config)
+        results, summary, _, _ = run_outage_validation(train_df, config)
         for _, row in results.iterrows():
             detailed = row.to_dict()
             detailed.update(

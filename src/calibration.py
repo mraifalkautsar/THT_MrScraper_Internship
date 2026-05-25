@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from .config import PipelineConfig
 
@@ -129,43 +131,113 @@ def add_anchor_residual_features(
     anchors = df[df[config.target].notna()].copy()
 
     if len(anchors) == 0:
-        df["anchor_global_delta"] = 0.0
-        df["anchor_residual_iqr"] = np.nan
-        df["anchor_count"] = 0
-        for key in config.calibration_keys:
-            df[f"{key}_stage_delta"] = 0.0
-            df[f"{key}_stage_anchor_count"] = 0
-        return df
+        return add_empty_anchor_residual_features(df, config)
 
     anchors["anchor_true_log"] = np.log1p(anchors[config.target].clip(lower=0))
     anchors["residual_log"] = anchors["anchor_true_log"] - anchors[pred_log_col]
     anchors = anchors.replace([np.inf, -np.inf], np.nan).dropna(subset=["residual_log"])
 
     if len(anchors) == 0:
-        df["anchor_global_delta"] = 0.0
-        df["anchor_residual_iqr"] = np.nan
-        df["anchor_count"] = 0
-        for key in config.calibration_keys:
-            df[f"{key}_stage_delta"] = 0.0
-            df[f"{key}_stage_anchor_count"] = 0
-        return df
+        return add_empty_anchor_residual_features(df, config)
 
     global_delta = anchors["residual_log"].median()
-    residual_iqr = anchors["residual_log"].quantile(0.75) - anchors["residual_log"].quantile(0.25)
+    residual_iqr = (
+        anchors["residual_log"].quantile(0.75)
+        - anchors["residual_log"].quantile(0.25)
+    )
     df["anchor_global_delta"] = global_delta
+    df["anchor_global_abs_delta"] = abs(global_delta)
+    df["anchor_residual_mean"] = anchors["residual_log"].mean()
+    df["anchor_residual_std"] = anchors["residual_log"].std()
     df["anchor_residual_iqr"] = residual_iqr
     df["anchor_count"] = len(anchors)
+    df["anchor_count_log"] = np.log1p(len(anchors))
 
     for key in config.calibration_keys:
         if key not in df.columns:
+            add_missing_segment_anchor_features(df, key)
             continue
         stats = anchors.groupby(key)["residual_log"].agg(["median", "count"]).reset_index()
         stats.columns = [key, f"{key}_stage_delta", f"{key}_stage_anchor_count"]
         df = df.merge(stats, on=key, how="left")
         df[f"{key}_stage_delta"] = df[f"{key}_stage_delta"].fillna(global_delta)
         df[f"{key}_stage_anchor_count"] = df[f"{key}_stage_anchor_count"].fillna(0)
+        count = df[f"{key}_stage_anchor_count"]
+        weight = count / (count + config.calibration_smoothing)
+        df[f"{key}_stage_weight"] = weight
+        df[f"{key}_stage_shrunk_delta"] = (
+            weight * df[f"{key}_stage_delta"] + (1 - weight) * global_delta
+        )
+        df[f"{key}_stage_delta_minus_global"] = df[f"{key}_stage_delta"] - global_delta
+        df[f"{key}_stage_anchor_count_log"] = np.log1p(count)
 
     return df
+
+
+def add_empty_anchor_residual_features(
+    df: pd.DataFrame, config: PipelineConfig
+) -> pd.DataFrame:
+    df["anchor_global_delta"] = 0.0
+    df["anchor_global_abs_delta"] = 0.0
+    df["anchor_residual_mean"] = 0.0
+    df["anchor_residual_std"] = 0.0
+    df["anchor_residual_iqr"] = np.nan
+    df["anchor_count"] = 0
+    df["anchor_count_log"] = 0.0
+    for key in config.calibration_keys:
+        add_missing_segment_anchor_features(df, key)
+    return df
+
+
+def add_missing_segment_anchor_features(df: pd.DataFrame, key: str) -> None:
+    df[f"{key}_stage_delta"] = 0.0
+    df[f"{key}_stage_anchor_count"] = 0.0
+    df[f"{key}_stage_weight"] = 0.0
+    df[f"{key}_stage_shrunk_delta"] = 0.0
+    df[f"{key}_stage_delta_minus_global"] = 0.0
+    df[f"{key}_stage_anchor_count_log"] = 0.0
+
+
+def get_second_stage_feature_columns(
+    df: pd.DataFrame, config: PipelineConfig
+) -> list[str]:
+    feature_cols = [
+        "model_pred_log",
+        "blended_pred_log",
+        "fallback_entity_price_log",
+        "fallback_entity_history_count",
+        "entity_weight",
+        "anchor_global_delta",
+        "anchor_global_abs_delta",
+        "anchor_residual_mean",
+        "anchor_residual_std",
+        "anchor_residual_iqr",
+        "anchor_count",
+        "anchor_count_log",
+    ]
+
+    for key in config.calibration_keys:
+        for suffix in [
+            "stage_delta",
+            "stage_anchor_count",
+            "stage_weight",
+            "stage_shrunk_delta",
+            "stage_delta_minus_global",
+            "stage_anchor_count_log",
+        ]:
+            feature_cols.append(f"{key}_{suffix}")
+
+    recent_cols = [
+        col
+        for col in df.columns
+        if col.endswith("_recent_prior_count")
+        or col.endswith("_hours_since_last_seen")
+        or col.endswith("_last_price_log")
+        or col.endswith("_last3_median_log")
+        or col.endswith("_last7_median_log")
+    ]
+    feature_cols.extend(recent_cols)
+    return [col for col in feature_cols if col in df.columns]
 
 
 def second_stage_residual_calibrate_day(
@@ -179,9 +251,10 @@ def second_stage_residual_calibrate_day(
     df[pred_log_col] = df[pred_log_col].fillna(df[pred_log_col].median()).fillna(0)
 
     anchors = df[df[config.target].notna()].copy()
-    if len(anchors) < 2:
+    if len(anchors) < config.second_stage_min_anchors:
         df["second_stage_delta_log"] = 0.0
         df["second_stage_applied"] = False
+        df["second_stage_skip_reason"] = "too_few_anchors"
         df["second_stage_pred_log"] = df[pred_log_col]
         return df.set_index("_orig_index")
 
@@ -189,29 +262,14 @@ def second_stage_residual_calibrate_day(
         pred_log_col
     ]
     anchors = anchors.replace([np.inf, -np.inf], np.nan).dropna(subset=["target_residual_log"])
-    if len(anchors) < 2:
+    if len(anchors) < config.second_stage_min_anchors:
         df["second_stage_delta_log"] = 0.0
         df["second_stage_applied"] = False
+        df["second_stage_skip_reason"] = "too_few_valid_anchor_residuals"
         df["second_stage_pred_log"] = df[pred_log_col]
         return df.set_index("_orig_index")
 
-    feature_cols = [
-        "model_pred_log",
-        "blended_pred_log",
-        "fallback_entity_price_log",
-        "fallback_entity_history_count",
-        "entity_weight",
-        "anchor_global_delta",
-        "anchor_residual_iqr",
-        "anchor_count",
-    ]
-    for key in config.calibration_keys:
-        for suffix in ["stage_delta", "stage_anchor_count"]:
-            col = f"{key}_{suffix}"
-            if col in df.columns:
-                feature_cols.append(col)
-
-    feature_cols = [col for col in feature_cols if col in df.columns]
+    feature_cols = get_second_stage_feature_columns(df, config)
     X_anchor = anchors[feature_cols].copy()
     X_all = df[feature_cols].copy()
 
@@ -219,7 +277,10 @@ def second_stage_residual_calibrate_day(
     X_anchor = X_anchor.fillna(medians).fillna(0)
     X_all = X_all.fillna(medians).fillna(0)
 
-    model = Ridge(alpha=config.second_stage_alpha)
+    model = make_pipeline(
+        StandardScaler(),
+        Ridge(alpha=config.second_stage_alpha),
+    )
     model.fit(X_anchor, anchors["target_residual_log"])
     delta = pd.Series(model.predict(X_all), index=df.index)
 
@@ -229,6 +290,7 @@ def second_stage_residual_calibrate_day(
 
     df["second_stage_delta_log"] = delta
     df["second_stage_applied"] = True
+    df["second_stage_skip_reason"] = "applied"
     df["second_stage_pred_log"] = df[pred_log_col] + df["second_stage_delta_log"]
     df["second_stage_pred_log"] = (
         df["second_stage_pred_log"]

@@ -11,8 +11,104 @@ from .config import PipelineConfig
 from .data import basic_preprocess
 
 
-DROP_COLS = {"target_log"}
+# Columns and feature groups
 
+DROP_COLS = {"target_log"}
+HIDDEN_UNAVAILABLE_RAW_COLS = {
+    "priceBeforeDiscount",
+    "promotionId",
+    "cat_id",
+    "stock",
+    "normal_stock",
+    "raw_discount",
+    "show_discount",
+    "brand",
+    "is_free_shipping",
+    "is_pre_order",
+    "item_price_min",
+    "item_price_max",
+    "review_rating",
+    "total_rating_count",
+    "cmt_count",
+    "shop_rating",
+    "shop_response_rate",
+    "shop_follower_count",
+    "is_official_shop",
+    "is_verified",
+    "is_preferred_plus_seller",
+}
+HISTORICALLY_RECOVERABLE_RAW_COLS = {
+    "cat_id",
+    "brand",
+    "is_free_shipping",
+    "is_pre_order",
+    "review_rating",
+    "total_rating_count",
+    "cmt_count",
+    "shop_rating",
+    "shop_response_rate",
+    "shop_follower_count",
+    "is_official_shop",
+    "is_verified",
+    "is_preferred_plus_seller",
+}
+VOLATILE_UNAVAILABLE_RAW_COLS = HIDDEN_UNAVAILABLE_RAW_COLS - HISTORICALLY_RECOVERABLE_RAW_COLS
+HIDDEN_UNAVAILABLE_DERIVED_COLS = {
+    "has_discount",
+    "discount_ratio",
+    "price_before_log",
+    "raw_discount_log",
+    "show_discount_ratio",
+    "stock_ratio",
+    "stock_gap",
+    "is_low_stock",
+    "total_rating_count_log",
+    "cmt_count_log",
+    "shop_follower_count_log",
+    "review_strength",
+    "shop_strength",
+}
+HISTORICALLY_RECOVERABLE_DERIVED_COLS = {
+    "total_rating_count_log",
+    "cmt_count_log",
+    "shop_follower_count_log",
+    "review_strength",
+    "shop_strength",
+}
+VOLATILE_UNAVAILABLE_DERIVED_COLS = (
+    HIDDEN_UNAVAILABLE_DERIVED_COLS - HISTORICALLY_RECOVERABLE_DERIVED_COLS
+)
+FALLBACK_FEATURE_COLS = {
+    "fallback_entity_price_log",
+    "fallback_entity_history_count",
+    "fallback_entity_source",
+}
+
+PRODUCT_METADATA_COLS = [
+    "cat_id",
+    "brand",
+    "is_free_shipping",
+    "is_pre_order",
+    "review_rating",
+    "total_rating_count",
+    "cmt_count",
+]
+SHOP_METADATA_COLS = [
+    "shop_rating",
+    "shop_response_rate",
+    "shop_follower_count",
+    "is_official_shop",
+    "is_verified",
+    "is_preferred_plus_seller",
+]
+HISTORICAL_METADATA_SOURCES = [
+    ("modelId", PRODUCT_METADATA_COLS),
+    ("itemId", PRODUCT_METADATA_COLS),
+    ("shopId", SHOP_METADATA_COLS),
+]
+
+
+# Row-level features
 
 def add_row_features(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     df = df.copy()
@@ -62,6 +158,110 @@ def add_row_features(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     return df
 
 
+# Historical metadata recovery
+
+def _available_metadata_cols(
+    history: pd.DataFrame,
+    result: pd.DataFrame,
+    candidate_cols: list[str],
+) -> list[str]:
+    return [
+        col
+        for col in candidate_cols
+        if col in history.columns and col in result.columns
+    ]
+
+
+def _normalise_missing_categorical_metadata(
+    history: pd.DataFrame,
+    result: pd.DataFrame,
+    cols: list[str],
+    config: PipelineConfig,
+) -> None:
+    for col in cols:
+        if col in config.cat_cols:
+            history[col] = history[col].replace("missing", np.nan)
+            result[col] = result[col].replace("missing", np.nan)
+
+
+def _build_metadata_asof_frame(
+    history: pd.DataFrame,
+    lookup: pd.DataFrame,
+    key: str,
+    cols: list[str],
+    config: PipelineConfig,
+) -> pd.DataFrame:
+    hist = history[[key, config.date_col, *cols]].copy()
+    _normalise_missing_categorical_metadata(hist, lookup, cols, config)
+    hist["_metadata_key"] = hist[key].astype("string")
+    hist = hist.dropna(subset=["_metadata_key", config.date_col])
+    hist = hist.sort_values([config.date_col, "_metadata_key"])
+    if hist.empty:
+        return pd.DataFrame(index=lookup.index)
+
+    target_times = lookup[[key, config.date_col]].copy()
+    target_times["_metadata_key"] = target_times[key].astype("string")
+    target_times["_metadata_orig_index"] = target_times.index
+    target_times = target_times[
+        ["_metadata_orig_index", "_metadata_key", config.date_col]
+    ]
+    target_times = target_times.dropna(subset=["_metadata_key", config.date_col])
+    target_times = target_times.sort_values([config.date_col, "_metadata_key"])
+
+    fill_cols = [config.date_col, "_metadata_key", *cols]
+    asof = pd.merge_asof(
+        target_times,
+        hist[fill_cols],
+        on=config.date_col,
+        by="_metadata_key",
+        direction="backward",
+        allow_exact_matches=False,
+    )
+    asof = asof.set_index("_metadata_orig_index")[cols]
+    return asof.rename(columns={col: f"__hist_{key}_{col}" for col in cols})
+
+
+def add_historical_metadata_imputations(
+    history_df: pd.DataFrame, df: pd.DataFrame, config: PipelineConfig
+) -> pd.DataFrame:
+    """Fill slow-moving blank test metadata from latest prior entity history."""
+    result = df.copy()
+    history = history_df.copy()
+    history[config.date_col] = pd.to_datetime(history[config.date_col], errors="coerce")
+    result[config.date_col] = pd.to_datetime(result[config.date_col], errors="coerce")
+
+    for col in HISTORICALLY_RECOVERABLE_RAW_COLS:
+        if col in result.columns:
+            result[f"{col}_imputed_from_history"] = False
+
+    for key, candidate_cols in HISTORICAL_METADATA_SOURCES:
+        if key not in history.columns or key not in result.columns:
+            continue
+
+        cols = _available_metadata_cols(history, result, candidate_cols)
+        if not cols:
+            continue
+
+        asof = _build_metadata_asof_frame(history, result, key, cols, config)
+        if asof.empty:
+            continue
+
+        result = result.join(asof)
+
+        for col in cols:
+            hist_col = f"__hist_{key}_{col}"
+            missing = result[col].isna()
+            has_history = result[hist_col].notna()
+            fill_mask = missing & has_history
+            result.loc[fill_mask, col] = result.loc[fill_mask, hist_col]
+            flag_col = f"{col}_imputed_from_history"
+            if flag_col in result.columns:
+                result.loc[fill_mask, flag_col] = True
+            result = result.drop(columns=[hist_col])
+
+    return result
+
+
 def compute_historical_price_stats(
     history_df: pd.DataFrame, config: PipelineConfig
 ) -> list[tuple[str, pd.DataFrame]]:
@@ -97,43 +297,33 @@ def add_historical_price_features(
         df = df.merge(agg, on=key, how="left")
 
     global_log_median = np.log1p(history_df[config.target].median())
-    df["fallback_entity_price_log"] = df.get(
-        "modelId_last_price_log", pd.Series(np.nan, index=df.index)
-    )
+    df["fallback_entity_price_log"] = np.nan
+    df["fallback_entity_history_count"] = 0.0
+    df["fallback_entity_source"] = "global_median"
 
-    if "itemId_last_price_log" in df.columns:
-        df["fallback_entity_price_log"] = df["fallback_entity_price_log"].fillna(
-            df["itemId_last_price_log"]
-        )
-
-    for col in [
-        "modelId_price_median_log",
-        "itemId_price_median_log",
-        "shopId_price_median_log",
-        "cat_id_price_median_log",
-        "brand_price_median_log",
-    ]:
-        df["fallback_entity_price_log"] = df["fallback_entity_price_log"].fillna(df[col])
+    fallback_sources = [
+        ("modelId_last_price_log", "modelId_recent_prior_count", "modelId_last_price"),
+        ("itemId_last_price_log", "itemId_recent_prior_count", "itemId_last_price"),
+        ("modelId_price_median_log", "modelId_price_count", "modelId_median"),
+        ("itemId_price_median_log", "itemId_price_count", "itemId_median"),
+        ("shopId_price_median_log", "shopId_price_count", "shopId_median"),
+        ("cat_id_price_median_log", "cat_id_price_count", "cat_id_median"),
+        ("brand_price_median_log", "brand_price_count", "brand_median"),
+    ]
+    for price_col, count_col, source_name in fallback_sources:
+        if price_col not in df.columns:
+            continue
+        use_source = df["fallback_entity_price_log"].isna() & df[price_col].notna()
+        df.loc[use_source, "fallback_entity_price_log"] = df.loc[use_source, price_col]
+        if count_col in df.columns:
+            df.loc[use_source, "fallback_entity_history_count"] = (
+                df.loc[use_source, count_col].fillna(0).astype(float)
+            )
+        df.loc[use_source, "fallback_entity_source"] = source_name
 
     df["fallback_entity_price_log"] = df["fallback_entity_price_log"].fillna(
         global_log_median
     )
-
-    df["fallback_entity_history_count"] = df.get(
-        "modelId_recent_prior_count", pd.Series(np.nan, index=df.index)
-    )
-
-    for col in [
-        "itemId_recent_prior_count",
-        "modelId_price_count",
-        "itemId_price_count",
-        "shopId_price_count",
-        "cat_id_price_count",
-    ]:
-        df["fallback_entity_history_count"] = df[
-            "fallback_entity_history_count"
-        ].fillna(df[col])
-    df["fallback_entity_history_count"] = df["fallback_entity_history_count"].fillna(0)
 
     return df
 
@@ -234,19 +424,36 @@ def add_recent_price_features(
 def build_features(
     history_df: pd.DataFrame, df: pd.DataFrame, config: PipelineConfig
 ) -> pd.DataFrame:
+    raw_features = add_historical_metadata_imputations(history_df, df, config)
     history = basic_preprocess(history_df, config)
-    features = basic_preprocess(df, config)
+    features = basic_preprocess(raw_features, config)
     features = add_row_features(features, config)
     features = add_recent_price_features(history, features, config)
     features = add_historical_price_features(history, features, config)
     return features
 
 
+def is_target_aggregate_feature(col: str, config: PipelineConfig) -> bool:
+    return any(col.startswith(f"{key}_price_") for key in config.history_keys)
+
+
 def get_feature_columns(df: pd.DataFrame, config: PipelineConfig) -> list[str]:
     excluded = {config.target, config.date_col, "date"} | DROP_COLS
+    if config.model_hidden_available_features_only:
+        excluded |= (
+            VOLATILE_UNAVAILABLE_RAW_COLS
+            | VOLATILE_UNAVAILABLE_DERIVED_COLS
+            | FALLBACK_FEATURE_COLS
+        )
     valid_cols = []
 
     for col in [c for c in df.columns if c not in excluded]:
+        if col.startswith("_validation_"):
+            continue
+        if config.model_hidden_available_features_only and is_target_aggregate_feature(
+            col, config
+        ):
+            continue
         dtype = df[col].dtype
         if (
             is_numeric_dtype(dtype)

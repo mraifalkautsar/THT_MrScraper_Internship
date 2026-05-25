@@ -24,6 +24,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs/tuning")
     parser.add_argument("--validation-days", type=int, default=3)
     parser.add_argument("--anchors-per-day", type=int, default=100)
+    parser.add_argument(
+        "--test-like-only",
+        action="store_true",
+        help="Tune on validation rows with prior modelId or itemId history only.",
+    )
+    parser.add_argument(
+        "--no-mask-hidden-like-test",
+        action="store_true",
+        help="Do not mask validation hidden-row columns to match real hidden test missingness.",
+    )
     parser.add_argument("--learning-rates", default="0.03,0.05")
     parser.add_argument("--depths", default="6,8")
     parser.add_argument("--iterations", default="800,1200")
@@ -57,6 +67,8 @@ def main() -> None:
         output_dir=Path(args.output_dir),
         validation_days=args.validation_days,
         anchors_per_day=args.anchors_per_day,
+        validation_test_like_only=args.test_like_only,
+        validation_mask_hidden_like_test=not args.no_mask_hidden_like_test,
         selective_calibration=args.selective_calibration,
         calibration_min_anchors=args.calibration_min_anchors,
         calibration_max_residual_iqr=args.calibration_max_residual_iqr,

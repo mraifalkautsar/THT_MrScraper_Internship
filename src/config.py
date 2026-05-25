@@ -12,6 +12,9 @@ class PipelineConfig:
     random_seed: int = 42
     validation_days: int = 3
     anchors_per_day: int = 100
+    validation_test_like_only: bool = False
+    validation_mask_hidden_like_test: bool = True
+    model_hidden_available_features_only: bool = True
     entity_smoothing: float = 20.0
     calibration_smoothing: float = 8.0
     calibration_delta_cap: float | None = None
@@ -20,8 +23,9 @@ class PipelineConfig:
     calibration_max_residual_iqr: float | None = None
     calibration_min_abs_global_delta: float = 0.0
     second_stage_alpha: float = 10.0
+    second_stage_min_anchors: int = 10
     include_experimental_variants: bool = False
-    prediction_variant: str = "hybrid_last_price_entity"
+    prediction_variant: str = "anchor_gated_fallback_calibration"
     catboost_iterations: int = 1200
     catboost_learning_rate: float = 0.05
     catboost_depth: int = 8
