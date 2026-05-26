@@ -11,6 +11,7 @@ def train_global_model(
     cat_feature_indices: list[int],
     config: PipelineConfig,
 ) -> CatBoostRegressor:
+    """Train the marketplace-wide CatBoost model on log-price targets."""
     train_df = train_df.dropna(subset=[config.target]).copy()
     train_df["target_log"] = np.log1p(train_df[config.target].clip(lower=0))
 
@@ -38,6 +39,7 @@ def add_model_predictions(
     feature_cols: list[str],
     config: PipelineConfig,
 ) -> pd.DataFrame:
+    """Add global model predictions and blend them with the entity price prior."""
     df = df.copy()
     for col in feature_cols:
         if col not in df.columns:
@@ -52,4 +54,3 @@ def add_model_predictions(
         + entity_weight * df["fallback_entity_price_log"]
     )
     return df
-

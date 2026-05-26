@@ -33,6 +33,7 @@ from .strategies import (
 def _calibrated_candidate_logs(
     day_df: pd.DataFrame, config: PipelineConfig
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.Series]]:
+    """Build calibrated and uncalibrated log-prediction candidates for inference."""
     cal_global = calibrate_all_days(
         day_df.assign(blended_pred_log=day_df["model_pred_log"]),
         config,
@@ -56,6 +57,7 @@ def _calibrated_candidate_logs(
 
 
 def add_final_prediction_by_variant(test_feat: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    """Attach final raw-price predictions according to the configured strategy."""
     df = test_feat.copy()
     variant = config.prediction_variant
 
@@ -160,6 +162,7 @@ def add_final_prediction_by_variant(test_feat: pd.DataFrame, config: PipelineCon
 def train_and_predict(
     train_df: pd.DataFrame, test_df: pd.DataFrame, config: PipelineConfig
 ) -> pd.DataFrame:
+    """Train required models, predict missing test prices, and validate the submission."""
     if config.prediction_variant == LAST_PRICE_BASELINE:
         test_feat = build_features(train_df, test_df, config)
     else:
@@ -186,6 +189,7 @@ def train_and_predict(
 
 
 def run_prediction(config: PipelineConfig) -> pd.DataFrame:
+    """Load configured CSVs, run prediction, and write the completed test file."""
     train_df, test_df = load_data(config.train_path, config.test_path)
     submission = train_and_predict(train_df, test_df, config)
     config.output_dir.mkdir(exist_ok=True)

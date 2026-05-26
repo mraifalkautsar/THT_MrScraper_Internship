@@ -10,6 +10,7 @@ from .config import PipelineConfig
 def _empty_calibration_result(
     df: pd.DataFrame, pred_log_col: str, reason: str
 ) -> pd.DataFrame:
+    """Return unchanged predictions with metadata explaining why calibration was skipped."""
     df["calibration_delta_log"] = 0.0
     df["calibration_applied"] = False
     df["calibration_skip_reason"] = reason
@@ -25,6 +26,7 @@ def calibrate_day_from_anchor_residuals(
     config: PipelineConfig,
     pred_log_col: str = "blended_pred_log",
 ) -> pd.DataFrame:
+    """Apply day and segment anchor-residual calibration to one outage day."""
     df = day_df.copy()
     df["_orig_index"] = df.index
 
@@ -114,6 +116,7 @@ def calibrate_day_from_anchor_residuals(
 def calibrate_all_days(
     df: pd.DataFrame, config: PipelineConfig, pred_log_col: str = "blended_pred_log"
 ) -> pd.DataFrame:
+    """Run anchor-residual calibration independently for each date."""
     calibrated = [
         calibrate_day_from_anchor_residuals(day_df, config, pred_log_col=pred_log_col)
         for _, day_df in df.groupby("date")
@@ -126,6 +129,7 @@ def add_anchor_residual_features(
     config: PipelineConfig,
     pred_log_col: str = "blended_pred_log",
 ) -> pd.DataFrame:
+    """Create global and segment anchor-residual features for second-stage modelling."""
     df = day_df.copy()
     df["_anchor_orig_index"] = df.index
     anchors = df[df[config.target].notna()].copy()
@@ -177,6 +181,7 @@ def add_anchor_residual_features(
 def add_empty_anchor_residual_features(
     df: pd.DataFrame, config: PipelineConfig
 ) -> pd.DataFrame:
+    """Add zero/default anchor-residual features when no valid anchors exist."""
     df["anchor_global_delta"] = 0.0
     df["anchor_global_abs_delta"] = 0.0
     df["anchor_residual_mean"] = 0.0
@@ -190,6 +195,7 @@ def add_empty_anchor_residual_features(
 
 
 def add_missing_segment_anchor_features(df: pd.DataFrame, key: str) -> None:
+    """Populate default segment residual feature columns for a missing calibration key."""
     df[f"{key}_stage_delta"] = 0.0
     df[f"{key}_stage_anchor_count"] = 0.0
     df[f"{key}_stage_weight"] = 0.0
@@ -201,6 +207,7 @@ def add_missing_segment_anchor_features(df: pd.DataFrame, key: str) -> None:
 def get_second_stage_feature_columns(
     df: pd.DataFrame, config: PipelineConfig
 ) -> list[str]:
+    """Select numeric features available to the learned second-stage residual model."""
     feature_cols = [
         "model_pred_log",
         "blended_pred_log",
@@ -245,6 +252,7 @@ def second_stage_residual_calibrate_day(
     config: PipelineConfig,
     pred_log_col: str = "blended_pred_log",
 ) -> pd.DataFrame:
+    """Fit a same-day Ridge residual model on anchors and correct hidden-row logs."""
     df = add_anchor_residual_features(day_df, config, pred_log_col=pred_log_col)
     df["_orig_index"] = df["_anchor_orig_index"]
     df[pred_log_col] = df[pred_log_col].fillna(df["fallback_entity_price_log"])
@@ -306,6 +314,7 @@ def second_stage_residual_calibrate_all_days(
     config: PipelineConfig,
     pred_log_col: str = "blended_pred_log",
 ) -> pd.DataFrame:
+    """Apply learned second-stage residual calibration independently by date."""
     calibrated = [
         second_stage_residual_calibrate_day(day_df, config, pred_log_col=pred_log_col)
         for _, day_df in df.groupby("date")

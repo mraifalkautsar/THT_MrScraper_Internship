@@ -11,6 +11,7 @@ from src.strategies import ALL_PREDICTION_VARIANTS, ANCHOR_GATED_FALLBACK_CALIBR
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI options for filling missing prices in the test file."""
     parser = argparse.ArgumentParser(description="Fill missing prices in the test file.")
     parser.add_argument("--train-path", default="ecommerce_price_prediction-train.csv")
     parser.add_argument("--test-path", default="ecommerce_price_prediction-test-3-days.csv")
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run the configured prediction pipeline and report output sanity checks."""
     args = parse_args()
     config = replace(
         PipelineConfig(),

@@ -17,6 +17,7 @@ from src.tuning import (
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI options for validation-based hyperparameter tuning."""
     parser = argparse.ArgumentParser(
         description="Tune CatBoost and post-processing hyperparameters."
     )
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run the tuning grid and print the best validation configuration."""
     args = parse_args()
     config = replace(
         PipelineConfig(),

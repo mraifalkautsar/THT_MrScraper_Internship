@@ -4,6 +4,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class PipelineConfig:
+    """Central immutable configuration for data paths, validation, models, and strategies."""
+
     train_path: Path = Path("ecommerce_price_prediction-train.csv")
     test_path: Path = Path("ecommerce_price_prediction-test-3-days.csv")
     output_dir: Path = Path("outputs")

@@ -36,6 +36,7 @@ from .strategies import (
 def evaluate_predictions(
     y_true: pd.Series, y_pred: pd.Series, name: str
 ) -> dict[str, float | int | str]:
+    """Compute MAE, RMSE, and percent-scale MAPE after dropping invalid rows."""
     eval_df = pd.DataFrame({"y_true": y_true.astype(float), "y_pred": y_pred.astype(float)})
     eval_df = eval_df.replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -69,6 +70,7 @@ def make_prediction_frame(
     target_col: str,
     calibration_meta: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    """Build row-level validation diagnostics for one strategy/date pair."""
     frame = pd.DataFrame(
         {
             "date": date,
@@ -139,6 +141,7 @@ def make_prediction_frame(
 
 
 def add_validation_segments(prediction_rows: pd.DataFrame) -> pd.DataFrame:
+    """Add diagnostic buckets for price, entity-history count, and calibration status."""
     df = prediction_rows.copy()
     df["price_bucket"] = "unknown"
     valid_price = df["y_true"].notna()
@@ -179,6 +182,7 @@ def add_validation_segments(prediction_rows: pd.DataFrame) -> pd.DataFrame:
 def aggregate_prediction_metrics(
     prediction_rows: pd.DataFrame, group_cols: list[str]
 ) -> pd.DataFrame:
+    """Aggregate row-level prediction errors for a requested segment grouping."""
     rows = []
     for keys, group in prediction_rows.groupby(group_cols, dropna=False):
         if not isinstance(keys, tuple):
@@ -198,6 +202,7 @@ def aggregate_prediction_metrics(
 
 
 def build_segment_summary(prediction_rows: pd.DataFrame) -> pd.DataFrame:
+    """Create validation metric tables by date, price, history, and calibration status."""
     segmented = add_validation_segments(prediction_rows)
     frames = []
     segment_specs = [
@@ -232,6 +237,7 @@ def filter_to_test_like_rows(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df[has_model_history | has_item_history].copy()
 
+
 def append_prediction_eval(
     eval_rows: list[dict[str, float | int | str]],
     prediction_rows: list[pd.DataFrame],
@@ -242,6 +248,7 @@ def append_prediction_eval(
     config: PipelineConfig,
     calibration_meta: pd.DataFrame | None = None,
 ) -> None:
+    """Append both aggregate metrics and row-level diagnostics for one strategy."""
     eval_rows.append(
         evaluate_predictions(hidden[config.target], y_pred, f"{date} {variant}")
     )
@@ -256,9 +263,11 @@ def append_prediction_eval(
         )
     )
 
+
 def calibrated_candidate_logs(
     day_df: pd.DataFrame, config: PipelineConfig
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.Series]]:
+    """Construct all standard validation candidate predictions in log-price space."""
     cal_global = calibrate_day_from_anchor_residuals(
         day_df.assign(blended_pred_log=day_df["model_pred_log"]),
         config,
@@ -282,7 +291,9 @@ def calibrated_candidate_logs(
     }
     return cal_global, cal_blend, candidates
 
+
 def add_validation_anchor_split(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    """Mark a fixed random sample of rows per day as visible validation anchors."""
     df = df.copy()
     if "_validation_row_id" not in df.columns:
         df["_validation_row_id"] = np.arange(len(df))
@@ -294,6 +305,7 @@ def add_validation_anchor_split(df: pd.DataFrame, config: PipelineConfig) -> pd.
         ).index
         df.loc[anchor_idx, "_validation_is_anchor"] = True
     return df
+
 
 def mask_hidden_validation_columns(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     """Mask held-out validation fields that are unavailable on real hidden test rows."""
@@ -307,9 +319,11 @@ def mask_hidden_validation_columns(df: pd.DataFrame, config: PipelineConfig) -> 
     df.loc[hidden_mask, cols_to_mask] = np.nan
     return df
 
+
 def run_outage_validation(
     train_df: pd.DataFrame, config: PipelineConfig
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Simulate outage days with anchors, evaluate strategies, and return diagnostics."""
     df = basic_preprocess(train_df, config)
     unique_dates = sorted(df["date"].unique())
     val_dates = unique_dates[-config.validation_days :]

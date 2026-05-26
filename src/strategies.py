@@ -42,6 +42,7 @@ ALL_PREDICTION_VARIANTS = (
 
 
 def log_predictions_to_price(pred_log: pd.Series) -> pd.Series:
+    """Convert log-price predictions back to nonnegative raw prices."""
     return np.expm1(pred_log).clip(lower=0)
 
 
@@ -55,6 +56,7 @@ def hybrid_last_price_then_log_prediction(
 
 
 def has_recent_entity_history(df: pd.DataFrame) -> pd.Series:
+    """Return rows where the fallback entity prior is supported by history."""
     return df["fallback_entity_history_count"].fillna(0) > 0
 
 
@@ -64,6 +66,7 @@ def score_anchor_mae(
     candidate_log_predictions: dict[str, pd.Series],
     anchor_mask: pd.Series | None = None,
 ) -> list[tuple[str, float]]:
+    """Score candidate log predictions by MAE on visible anchor rows."""
     anchors = day_df[day_df[target_col].notna()].copy()
     if anchor_mask is not None:
         anchors = anchors[anchor_mask.reindex(anchors.index).fillna(False)]

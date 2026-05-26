@@ -11,10 +11,12 @@ from .validation import run_outage_validation
 
 
 def parse_grid(values: str, cast: type) -> list[Any]:
+    """Parse a comma-separated CLI grid into typed values."""
     return [cast(value.strip()) for value in values.split(",") if value.strip()]
 
 
 def parse_optional_float_grid(values: str) -> list[float | None]:
+    """Parse float grids where none/null/no_cap disable a calibration cap."""
     parsed = []
     for value in values.split(","):
         value = value.strip()
@@ -28,6 +30,7 @@ def parse_optional_float_grid(values: str) -> list[float | None]:
 
 
 def choose_best_variant(summary: pd.DataFrame, selection_metric: str) -> pd.Series:
+    """Select the best validation strategy by one metric or a simple composite rank."""
     candidates = summary.reset_index().copy()
     metric = selection_metric.upper()
     if metric in {"MAE", "RMSE", "MAPE"}:
@@ -54,6 +57,7 @@ def tune_pipeline(
     selection_metric: str = "MAE",
     max_trials: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run outage validation across a hyperparameter grid and collect best variants."""
     tuning_rows = []
     detailed_results = []
 
@@ -149,6 +153,7 @@ def save_tuning_outputs(
     tuning_details: pd.DataFrame,
     output_dir: Path,
 ) -> None:
+    """Write tuning summary and per-run details to the configured output directory."""
     output_dir.mkdir(exist_ok=True)
     tuning_summary.to_csv(output_dir / "tuning_summary.csv", index=False)
     tuning_details.to_csv(output_dir / "tuning_details.csv", index=False)

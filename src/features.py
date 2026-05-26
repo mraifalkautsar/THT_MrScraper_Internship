@@ -111,6 +111,7 @@ HISTORICAL_METADATA_SOURCES = [
 # Row-level features
 
 def add_row_features(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    """Create row-level time, discount, stock, rating, and shop-strength features."""
     df = df.copy()
     dt = df[config.date_col]
 
@@ -165,6 +166,7 @@ def _available_metadata_cols(
     result: pd.DataFrame,
     candidate_cols: list[str],
 ) -> list[str]:
+    """Keep metadata columns that exist in both history and target frames."""
     return [
         col
         for col in candidate_cols
@@ -178,6 +180,7 @@ def _normalise_missing_categorical_metadata(
     cols: list[str],
     config: PipelineConfig,
 ) -> None:
+    """Treat the categorical sentinel 'missing' as null before historical imputation."""
     for col in cols:
         if col in config.cat_cols:
             history[col] = history[col].replace("missing", np.nan)
@@ -191,6 +194,7 @@ def _build_metadata_asof_frame(
     cols: list[str],
     config: PipelineConfig,
 ) -> pd.DataFrame:
+    """Look up latest strictly prior metadata by entity key using an as-of join."""
     hist = history[[key, config.date_col, *cols]].copy()
     _normalise_missing_categorical_metadata(hist, lookup, cols, config)
     hist["_metadata_key"] = hist[key].astype("string")
@@ -265,6 +269,7 @@ def add_historical_metadata_imputations(
 def compute_historical_price_stats(
     history_df: pd.DataFrame, config: PipelineConfig
 ) -> list[tuple[str, pd.DataFrame]]:
+    """Compute leakage-safe historical log-price aggregates for configured entity keys."""
     history = history_df.dropna(subset=[config.target]).copy()
     history["target_log"] = np.log1p(history[config.target].clip(lower=0))
     agg_frames = []
@@ -292,6 +297,7 @@ def compute_historical_price_stats(
 def add_historical_price_features(
     history_df: pd.DataFrame, df: pd.DataFrame, config: PipelineConfig
 ) -> pd.DataFrame:
+    """Merge historical aggregates and choose the best fallback entity price prior."""
     df = df.copy()
     for key, agg in compute_historical_price_stats(history_df, config):
         df = df.merge(agg, on=key, how="left")
@@ -334,6 +340,7 @@ def _recent_stats_for_key(
     key: str,
     config: PipelineConfig,
 ) -> pd.DataFrame:
+    """Compute prior-only recent price features for one entity key."""
     result = pd.DataFrame(index=df.index)
     prefix = key
     for col in [
@@ -414,6 +421,7 @@ def _recent_stats_for_key(
 def add_recent_price_features(
     history_df: pd.DataFrame, df: pd.DataFrame, config: PipelineConfig
 ) -> pd.DataFrame:
+    """Add recent last-price and rolling-median features for modelId and itemId."""
     df = df.copy()
     for key in ["modelId", "itemId"]:
         recent = _recent_stats_for_key(history_df, df, key, config)
@@ -424,6 +432,7 @@ def add_recent_price_features(
 def build_features(
     history_df: pd.DataFrame, df: pd.DataFrame, config: PipelineConfig
 ) -> pd.DataFrame:
+    """Build all prediction features using only the supplied historical frame as history."""
     raw_features = add_historical_metadata_imputations(history_df, df, config)
     history = basic_preprocess(history_df, config)
     features = basic_preprocess(raw_features, config)
@@ -434,10 +443,12 @@ def build_features(
 
 
 def is_target_aggregate_feature(col: str, config: PipelineConfig) -> bool:
+    """Identify target-derived historical aggregate columns by naming convention."""
     return any(col.startswith(f"{key}_price_") for key in config.history_keys)
 
 
 def get_feature_columns(df: pd.DataFrame, config: PipelineConfig) -> list[str]:
+    """Select model-safe feature columns and exclude unavailable or target-derived fields."""
     excluded = {config.target, config.date_col, "date"} | DROP_COLS
     if config.model_hidden_available_features_only:
         excluded |= (
@@ -469,6 +480,7 @@ def get_feature_columns(df: pd.DataFrame, config: PipelineConfig) -> list[str]:
 def get_cat_feature_indices(
     df: pd.DataFrame, feature_cols: list[str], config: PipelineConfig
 ) -> list[int]:
+    """Return CatBoost categorical feature indices for configured/string columns."""
     cat_cols = [
         col
         for col in feature_cols

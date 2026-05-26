@@ -6,10 +6,12 @@ from .config import PipelineConfig
 
 
 def load_data(train_path: str | Path, test_path: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the historical train data and outage-style test data from CSV files."""
     return pd.read_csv(train_path), pd.read_csv(test_path)
 
 
 def basic_preprocess(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+    """Normalize timestamps, date keys, booleans, and categorical missing values."""
     df = df.copy()
     df[config.date_col] = pd.to_datetime(df[config.date_col], errors="coerce")
     df["date"] = df[config.date_col].dt.date.astype(str)
@@ -46,6 +48,7 @@ def basic_preprocess(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
 def assert_submission_valid(
     original_test: pd.DataFrame, submission: pd.DataFrame, config: PipelineConfig
 ) -> None:
+    """Validate final output shape, filled prices, nonnegative values, and anchor preservation."""
     if len(original_test) != len(submission):
         raise ValueError("Submission row count does not match test row count.")
     if submission[config.target].isna().any():
@@ -59,4 +62,3 @@ def assert_submission_valid(
         submitted_anchor = submission.loc[anchor_mask, config.target].astype("int64")
         if not original_anchor.equals(submitted_anchor):
             raise ValueError("Known anchor prices were modified in the submission.")
-

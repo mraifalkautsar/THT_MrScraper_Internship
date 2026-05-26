@@ -12,6 +12,7 @@ from src.validation import run_outage_validation
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI options for outage-style validation."""
     parser = argparse.ArgumentParser(description="Run outage-style validation.")
     parser.add_argument("--train-path", default="ecommerce_price_prediction-train.csv")
     parser.add_argument("--output-dir", default="outputs")
@@ -45,6 +46,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Load data, run validation, and save summary/segment/row-level outputs."""
     args = parse_args()
     config = replace(
         PipelineConfig(),
